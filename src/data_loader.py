@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 
 MOEX_BASE = "https://iss.moex.com/iss"
 
-# Импортируем функции для работы с БД
+# Импорты для БД
 from src.database import add_bond, add_price, get_bond_id_by_isin, get_last_price_date
 
 def fetch_json(url, params=None):
@@ -102,20 +102,20 @@ def fetch_price_history(isin, from_date, till_date):
     if not data:
         return []
 
-    # Иногда API возвращает список, иногда словарь с ключом history
+    # Обработка ответа, который может быть списком
     if isinstance(data, list):
-        # Пытаемся найти блок history в первом элементе списка (если это список словарей)
-        if len(data) > 0 and isinstance(data[0], dict):
-            history_block = data[0].get("history")
+        for item in data:
+            if isinstance(item, dict) and "history" in item:
+                data = item
+                break
         else:
-            logger.warning(f"Неожиданный формат ответа для {isin}: список без history. Пропускаем.")
+            logger.warning(f"Не удалось найти блок 'history' для {isin}")
             return []
-    else:
-        history_block = data.get("history")
 
+    history_block = data.get("history")
     if not history_block:
         return []
-    
+
     history_data = history_block.get("data", [])
     cols = history_block["columns"]
     idx_date = cols.index("TRADEDATE")
@@ -185,3 +185,166 @@ DEFAULT_ISINS = [
     "RU000A103R61",   # Газпром нефть 003P-01R (корп)
     "RU000A105A92",   # Замещающая облигация Газпрома (пример)
 ]
+
+def get_all_bonds_securities():
+    base_url = f"{MOEX_BASE}/engines/stock/markets/bonds/securities.json"
+    all_rows = []
+    columns = None
+    start = 0
+    limit = 100
+
+    while True:
+        params = {
+            "start": start,
+            "limit": limit,
+            "iss.json": "extended",
+            "iss.meta": "off"
+        }
+        data = fetch_json(base_url, params)
+        if not data:
+            break
+
+        # Отладка
+        logger.info(f"Ответ: тип {type(data)}")
+        if isinstance(data, dict):
+            logger.info(f"Ключи: {list(data.keys())}")
+        elif isinstance(data, list):
+            logger.info(f"Список из {len(data)} элементов")
+            if data:
+                logger.info(f"Первый элемент типа {type(data[0])}: {data[0] if not isinstance(data[0], dict) else list(data[0].keys())}")
+
+        # Нормализация
+        if isinstance(data, list):
+            found = False
+            for item in data:
+                if isinstance(item, dict) and "securities" in item:
+                    data = item
+                    found = True
+                    break
+            if not found:
+                logger.warning("Не найден блок securities в списке")
+                break
+
+        if not isinstance(data, dict):
+            logger.warning(f"data не словарь: {type(data)}")
+            break
+
+        securities_block = data.get("securities")
+        if not securities_block:
+            logger.info("Нет блока securities")
+            break
+
+        if isinstance(securities_block, dict):
+            rows = securities_block.get("data", [])
+            if columns is None:
+                columns = securities_block.get("columns", [])
+        elif isinstance(securities_block, list):
+            rows = []
+            for block in securities_block:
+                if isinstance(block, dict):
+                    rows.extend(block.get("data", []))
+                    if columns is None:
+                        columns = block.get("columns", [])
+        else:
+            logger.warning(f"Неизвестный тип securities_block: {type(securities_block)}")
+            break
+
+        if not rows:
+            break
+
+        all_rows.extend(rows)
+        if len(rows) < limit:
+            break
+        start += limit
+        time.sleep(0.1)
+
+    if not all_rows or not columns:
+        logger.warning("Не удалось получить данные облигаций через новый эндпоинт")
+        return []
+
+    # --- Обработка строк (скопируйте из предыдущей версии) ---
+    # ... вставьте сюда весь код обработки, начиная с isin_idx = columns.index("ISIN") ...
+
+def load_all_bonds_to_db(conn):
+    """
+    Загружает все облигации (только справочник) из MOEX в таблицу bonds.
+    Возвращает количество добавленных записей.
+    """
+    bonds = get_all_bonds_securities()
+    if not bonds:
+        return 0
+    count = 0
+    for bond in bonds:
+        add_bond(conn, **bond)
+        count += 1
+    conn.commit()
+    return count
+import csv
+import io
+
+def load_bonds_from_csv(conn, csv_file):
+    """
+    Загружает облигации из CSV-файла. Ожидается колонка 'isin' (или первая колонка).
+    Возвращает (added_count, skipped_count).
+    """
+    content = csv_file.getvalue().decode('utf-8')
+    reader = csv.DictReader(io.StringIO(content))
+    isin_list = []
+    # Ищем колонку isin (регистронезависимо)
+    for row in reader:
+        isin = None
+        for key in row:
+            if key.lower() == 'isin':
+                isin = row[key].strip()
+                break
+        if not isin and len(row) > 0:
+            # Если нет isin, берём первую колонку
+            isin = list(row.values())[0].strip()
+        if isin:
+            isin_list.append(isin)
+
+    if not isin_list:
+        return 0, 0
+
+    added = 0
+    skipped = 0
+    for isin in isin_list:
+        info = get_bond_info_from_moex(isin)
+        if info:
+            add_bond(conn, **info)
+            added += 1
+        else:
+            logger.warning(f"Не удалось получить данные для {isin}")
+            skipped += 1
+    conn.commit()
+    return added, skipped
+def prices_to_csv(conn, isin):
+    """
+    Получает все цены для облигации по ISIN и возвращает строку в формате CSV.
+    Колонки: Дата, Цена закрытия, НКД.
+    """
+    import csv
+    import io
+
+    bond = conn.execute("SELECT name FROM bonds WHERE isin = ?", (isin,)).fetchone()
+    if not bond:
+        return None
+
+    price_rows = conn.execute("""
+        SELECT date, price, nkd 
+        FROM prices p
+        JOIN bonds b ON p.bond_id = b.id
+        WHERE b.isin = ?
+        ORDER BY date
+    """, (isin,)).fetchall()
+
+    if not price_rows:
+        return None
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['Дата', 'Цена закрытия (% номинала)', 'НКД (руб.)'])
+    for row in price_rows:
+        writer.writerow([row['date'], row['price'], row['nkd']])
+
+    return output.getvalue()

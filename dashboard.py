@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 from datetime import date
+from src.database import get_last_price_date
+from src.data_loader import prices_to_csv
 
 from src.database import (
     init_db, get_connection,
@@ -54,7 +56,14 @@ with st.sidebar:
         st.success("Данные загружены!")
         st.cache_data.clear()
         st.rerun()
-
+    # Загрузка всех облигаций (только справочник)
+    if st.button("📚 Загрузить все облигации с MOEX (без цен)"):
+        with st.spinner("Загружаю список всех облигаций... Это может занять 1-2 минуты"):
+            from src.data_loader import load_all_bonds_to_db
+            added = load_all_bonds_to_db(conn)
+        st.success(f"Добавлено {added} облигаций в справочник!")
+        st.cache_data.clear()
+        st.rerun()
     st.divider()
 
     st.subheader("📥 Загрузить свои облигации")
@@ -63,7 +72,6 @@ with st.sidebar:
 
     if st.button("Загрузить введённые ISIN"):
         if user_isins.strip():
-            # Убираем дубликаты и пустые строки
             isin_list = list(set(i.strip() for i in user_isins.splitlines() if i.strip()))
             with st.spinner(f"Загружаю {len(isin_list)} облигаций..."):
                 load_bonds_and_prices(conn, isin_list)
@@ -75,6 +83,21 @@ with st.sidebar:
 
     st.divider()
 
+    st.subheader("📁 Загрузить ISIN из CSV")
+    uploaded_file = st.file_uploader("Выберите CSV-файл", type=["csv"])
+    if uploaded_file is not None:
+        if st.button("Загрузить из CSV"):
+            from src.data_loader import load_bonds_from_csv
+            added, skipped = load_bonds_from_csv(conn, uploaded_file)
+            if added > 0:
+                st.success(f"Загружено {added} облигаций, пропущено {skipped}.")
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.warning("Не удалось загрузить ни одной облигации. Проверьте формат файла.")
+
+    st.divider()
+
     bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
     price_count = conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
     st.metric("Облигаций в базе", bond_count)
@@ -83,10 +106,30 @@ with st.sidebar:
     st.divider()
 
     st.subheader("➕ Новая сделка")
-    with st.form("add_transaction"):
-        isin_list = [row["isin"] for row in conn.execute("SELECT isin FROM bonds").fetchall()]
-        if isin_list:
-            selected_isin = st.selectbox("ISIN облигации", isin_list)
+    search_isin = st.text_input("Поиск облигации по ISIN или названию", key="isin_search")
+
+    matching_bonds = []
+    if search_isin:
+        search_term = f"%{search_isin}%"
+        matching_bonds = conn.execute("""
+            SELECT isin, name, nominal, currency
+            FROM bonds
+            WHERE isin LIKE ? OR name LIKE ?
+            ORDER BY isin
+            LIMIT 50
+        """, (search_term, search_term)).fetchall()
+
+    selected_isin = None
+    bond_info = None
+    if matching_bonds:
+        options = [f"{b['isin']} – {b['name']} ({b['currency']})" for b in matching_bonds]
+        choice = st.radio("Найденные облигации:", options)
+        selected_isin = choice.split(" – ")[0]
+        bond_info = next((b for b in matching_bonds if b['isin'] == selected_isin), None)
+
+    if selected_isin and bond_info:
+        with st.form("add_transaction"):
+            st.write(f"**{bond_info['name']}** (номинал: {bond_info['nominal']} {bond_info['currency']})")
             tx_type = st.radio("Тип", ["BUY", "SELL"], horizontal=True)
             tx_date = st.date_input("Дата сделки", value=date.today())
             qty = st.number_input("Количество (бумаг)", min_value=1, step=1)
@@ -103,14 +146,68 @@ with st.sidebar:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (bond_id, tx_date.strftime("%Y-%m-%d"), tx_type, qty, tx_price, tx_nkd, tx_commission))
                     conn.commit()
-                    st.cache_data.clear()      # сбрасываем кеш метрик и купонов
+                    st.cache_data.clear()
                     st.success(f"Сделка {tx_type} {qty} шт. {selected_isin} добавлена!")
                     st.rerun()
                 else:
                     st.error("Облигация не найдена в базе.")
-        else:
-            st.warning("Сначала загрузите облигации через кнопку выше.")
+    elif search_isin and not matching_bonds:
+        st.info("Ничего не найдено. Попробуйте другой ISIN или название.")
+    else:
+        st.info("Введите ISIN или часть названия для поиска.")
 
+    with st.expander("📋 Все доступные облигации"):
+        all_bonds = conn.execute("SELECT isin, name, nominal, currency, bond_type FROM bonds ORDER BY isin").fetchall()
+        if all_bonds:
+            st.dataframe(pd.DataFrame(all_bonds), use_container_width=True)
+        else:
+            st.info("Справочник пуст.")
+
+    st.divider()
+    st.subheader("🗑 Управление данными")
+
+    delete_isin = st.selectbox(
+        "Выберите ISIN для удаления",
+        options=[""] + [row["isin"] for row in conn.execute("SELECT isin FROM bonds").fetchall()]
+    )
+    if delete_isin and st.button("❌ Удалить облигацию"):
+        if st.session_state.get("confirm_delete") != delete_isin:
+            st.warning(f"Подтвердите удаление {delete_isin}, нажав кнопку ещё раз.")
+            st.session_state.confirm_delete = delete_isin
+        else:
+            from src.database import delete_bond
+            if delete_bond(conn, delete_isin):
+                st.cache_data.clear()
+                st.success(f"Облигация {delete_isin} и связанные данные удалены.")
+                st.session_state.confirm_delete = None
+                st.rerun()
+            else:
+                st.error("Ошибка удаления.")
+
+    st.divider()
+    if st.button("🧹 Очистить все сделки (портфель)"):
+        if st.session_state.get("confirm_clear_tx") != True:
+            st.warning("Подтвердите очистку всех сделок, нажав кнопку ещё раз.")
+            st.session_state.confirm_clear_tx = True
+        else:
+            from src.database import clear_transactions
+            clear_transactions(conn)
+            st.cache_data.clear()
+            st.success("Все сделки удалены. Портфель пуст.")
+            st.session_state.confirm_clear_tx = False
+            st.rerun()
+
+    if st.button("💣 Очистить ВСЕ данные (бонды, цены, сделки)"):
+        if st.session_state.get("confirm_clear_all") != True:
+            st.warning("Подтвердите полную очистку базы данных, нажав кнопку ещё раз.")
+            st.session_state.confirm_clear_all = True
+        else:
+            from src.database import clear_all_data
+            clear_all_data(conn)
+            st.cache_data.clear()
+            st.success("База данных полностью очищена.")
+            st.session_state.confirm_clear_all = False
+            st.rerun()
 # ---------- Вкладки ----------
 tab1, tab2, tab3, tab4 = st.tabs(["📋 Обзор", "🗂 Структура", "💰 Купоны", "⚠️ Риски"])
 
@@ -192,6 +289,26 @@ with tab1:
                         weighted_md += md_values[i] * weight
             st.metric("Средневзвешенная YTM портфеля", f"{weighted_ytm:.2f}%")
             st.metric("Средневзвешенная модифицированная дюрация портфеля", f"{weighted_md:.2f}%")
+
+        # --- Экспорт CSV ---
+        st.divider()
+        st.subheader("📥 Экспорт цен")
+        export_isin = st.selectbox(
+            "Выберите облигацию для экспорта котировок",
+            options=df["ISIN"].tolist()
+        )
+        if export_isin:
+            csv_data = prices_to_csv(conn, export_isin)
+            if csv_data:
+                bond_name = conn.execute("SELECT name FROM bonds WHERE isin=?", (export_isin,)).fetchone()['name']
+                st.download_button(
+                    label=f"Скачать CSV для {export_isin}",
+                    data=csv_data,
+                    file_name=f"{export_isin}_prices.csv",
+                    mime="text/csv"
+                )
+            else:
+                st.info("Нет данных о ценах для выбранной облигации.")
 
 with tab2:
     st.header("Структура портфеля")

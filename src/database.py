@@ -132,3 +132,25 @@ def get_last_price_date(conn, isin):
         WHERE b.isin = ?
     """, (isin,)).fetchone()
     return row[0] if row and row[0] else None
+def delete_bond(conn, isin):
+    """Удаляет облигацию и все связанные записи (цены, сделки) по ISIN."""
+    bond_id = get_bond_id_by_isin(conn, isin)
+    if bond_id is None:
+        return False
+    conn.execute("DELETE FROM prices WHERE bond_id = ?", (bond_id,))
+    conn.execute("DELETE FROM transactions WHERE bond_id = ?", (bond_id,))
+    conn.execute("DELETE FROM bonds WHERE id = ?", (bond_id,))
+    conn.commit()
+    return True
+
+def clear_transactions(conn):
+    """Удаляет все сделки из таблицы transactions."""
+    conn.execute("DELETE FROM transactions")
+    conn.commit()
+
+def clear_all_data(conn):
+    """Полная очистка: удаляет все записи из bonds, prices, transactions."""
+    conn.execute("DELETE FROM transactions")
+    conn.execute("DELETE FROM prices")
+    conn.execute("DELETE FROM bonds")
+    conn.commit()
