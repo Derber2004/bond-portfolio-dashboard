@@ -3,8 +3,13 @@ from datetime import date
 from scipy.optimize import newton
 import pandas as pd
 
-def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, current_date=None):
-    """Доходность к погашению (YTM) через численное решение (Ньютон)."""
+def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, 
+             current_date=None, nkd=0.0):
+    """
+    Доходность к погашению (YTM) с учётом НКД.
+    price_percent: чистая цена в % от номинала
+    nkd: накопленный купонный доход в рублях (передаётся из БД)
+    """
     if price_percent is None or nominal is None or coupon_rate is None or not maturity_date:
         return None
 
@@ -26,7 +31,8 @@ def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, curr
         total_periods = 1
 
     coupon_payment = nominal * (coupon_rate / 100.0) / periods_per_year
-    dirty_price = price_percent / 100.0 * nominal
+    # Полная (грязная) цена
+    full_price = price_percent / 100.0 * nominal + nkd
 
     def npv(y):
         y = y / 100.0
@@ -37,7 +43,7 @@ def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, curr
             if i == total_periods:
                 cf += nominal
             pv += cf / ((1 + y) ** t)
-        return pv - dirty_price
+        return pv - full_price
 
     initial_guess = max(coupon_rate / 100.0, 0.001)
     try:
@@ -46,10 +52,11 @@ def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, curr
     except (RuntimeError, ValueError):
         return None
 
-def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm=None):
-    """Модифицированная дюрация (в процентах)."""
+def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_date, 
+                      ytm=None, nkd=0.0):
+    """Модифицированная дюрация с учётом НКД."""
     if ytm is None:
-        ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date)
+        ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, nkd=nkd)
     if ytm is None:
         return None
 
@@ -63,7 +70,7 @@ def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_d
     total_periods = int(np.ceil(days_to_maturity / 365.0 * periods_per_year))
 
     coupon_payment = nominal * (coupon_rate / 100.0) / periods_per_year
-    dirty_price = price_percent / 100.0 * nominal
+    full_price = price_percent / 100.0 * nominal + nkd
 
     macaulay = 0.0
     for i in range(1, total_periods + 1):
@@ -73,15 +80,16 @@ def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_d
             cf += nominal
         pv_cf = cf / ((1 + y) ** t)
         macaulay += t * pv_cf
-    macaulay /= dirty_price
+    macaulay /= full_price
 
     mod_dur = macaulay / (1 + y / periods_per_year)
     return mod_dur * 100
 
-def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm=None):
-    """Выпуклость (convexity)."""
+def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, 
+              ytm=None, nkd=0.0):
+    """Выпуклость с учётом НКД."""
     if ytm is None:
-        ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date)
+        ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, nkd=nkd)
     if ytm is None:
         return None
 
@@ -95,7 +103,7 @@ def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm
     total_periods = int(np.ceil(days_to_maturity / 365.0 * periods_per_year))
 
     coupon_payment = nominal * (coupon_rate / 100.0) / periods_per_year
-    dirty_price = price_percent / 100.0 * nominal
+    full_price = price_percent / 100.0 * nominal + nkd
 
     conv = 0.0
     for i in range(1, total_periods + 1):
@@ -105,16 +113,12 @@ def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm
             cf += nominal
         pv_cf = cf / ((1 + y) ** t)
         conv += t * (t + 1) * pv_cf
-    conv = conv / ((1 + y) ** 2) / dirty_price
+    conv = conv / ((1 + y) ** 2) / full_price
     return conv / (periods_per_year ** 2)
 
 def calculate_historical_var(conn, confidence=0.95, horizon_days=10):
-    """
-    Исторический VaR портфеля на основе дневных изменений цен облигаций.
-    Использует последние доступные цены для всех бумаг в портфеле и их веса.
-    Возвращает VaR в денежном выражении.
-    """
-    # Получаем текущие позиции с последней ценой через оконную функцию
+    # ... без изменений, код остаётся тем же, что в последней версии
+    # Приводим полностью для целостности
     positions = conn.execute("""
         WITH last_prices AS (
             SELECT bond_id, price, nkd,
@@ -171,7 +175,7 @@ def calculate_historical_var(conn, confidence=0.95, horizon_days=10):
     return -var_horizon
 
 def get_portfolio_metrics(conn):
-    """Возвращает словарь с ключевыми портфельными метриками."""
+    """Средневзвешенные метрики с учётом НКД."""
     from src.database import get_portfolio_positions
 
     positions = get_portfolio_positions(conn)
@@ -208,13 +212,18 @@ def get_portfolio_metrics(conn):
 
         info = bonds_info.get(isin)
         if info:
-            ytm = calc_ytm(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'])
+            ytm = calc_ytm(price, info['nominal'], info['coupon_rate'], 
+                           info['coupon_frequency'], info['maturity_date'], nkd=nkd)
             if ytm is not None:
                 weighted_ytm_sum += ytm * value
-            dur = modified_duration(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'], ytm)
+            dur = modified_duration(price, info['nominal'], info['coupon_rate'], 
+                                    info['coupon_frequency'], info['maturity_date'], 
+                                    ytm=ytm, nkd=nkd)
             if dur is not None:
                 weighted_dur_sum += dur * value
-            conv = convexity(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'], ytm)
+            conv = convexity(price, info['nominal'], info['coupon_rate'], 
+                             info['coupon_frequency'], info['maturity_date'], 
+                             ytm=ytm, nkd=nkd)
             if conv is not None:
                 weighted_conv_sum += conv * value
 

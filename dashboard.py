@@ -5,10 +5,10 @@ from datetime import date
 from src.database import (
     init_db, get_connection,
     add_bond, add_price, get_bond_id_by_isin,
-    get_portfolio_positions
+    get_portfolio_positions, DATABASE_PATH
 )
 from src.data_loader import load_bonds_and_prices, DEFAULT_ISINS
-from src.metrics import calc_ytm, modified_duration
+from src.metrics import calc_ytm, modified_duration, convexity, calculate_historical_var, get_portfolio_metrics
 
 st.set_page_config(
     page_title="Мой портфель облигаций",
@@ -16,49 +16,65 @@ st.set_page_config(
     layout="wide"
 )
 
-# Инициализация БД
 init_db()
 
-# Подключение к БД (потокобезопасное, кэшируем один раз за сессию)
 @st.cache_resource
 def get_db_connection():
     return get_connection()
 
 conn = get_db_connection()
 
+# ---------- Кешируемые обёртки ----------
+@st.cache_data(ttl=600)
+def cached_coupon_flow():
+    """Кешируемая версия get_portfolio_coupon_flow."""
+    from src.coupons import get_portfolio_coupon_flow
+    return get_portfolio_coupon_flow(get_db_connection())
+
+@st.cache_data(ttl=600)
+def cached_portfolio_metrics():
+    """Кешируемая версия get_portfolio_metrics."""
+    return get_portfolio_metrics(get_db_connection())
+
+@st.cache_data(ttl=600)
+def cached_var(confidence, horizon):
+    """Кешируемая версия calculate_historical_var."""
+    return calculate_historical_var(get_db_connection(), confidence, horizon)
+
+# ---------- Интерфейс ----------
 st.title("📈 Мой портфель облигаций")
 st.markdown("Дашборд для анализа доходности, рисков и структуры портфеля.")
 
-# ===================== САЙДБАР =====================
 with st.sidebar:
     st.header("⚙️ Управление данными")
 
-    # Загрузка тестовых облигаций
-        # Загрузка тестовых облигаций
     if st.button("🔄 Загрузить тестовые облигации с MOEX"):
-        with st.spinner("Загружаю данные... Это может занять ~30 секунд"):
+        with st.spinner("Загружаю..."):
             load_bonds_and_prices(conn, DEFAULT_ISINS)
         st.success("Данные загружены!")
+        st.cache_data.clear()
         st.rerun()
 
     st.divider()
 
-    # Загрузка произвольных ISIN
     st.subheader("📥 Загрузить свои облигации")
-    st.caption("Введите ISIN (по одному на строке).\nПример: SU26238RMFS4")
+    st.caption("Введите ISIN (по одному на строке).")
     user_isins = st.text_area("Список ISIN", height=100, placeholder="SU26226RMFS5\nRU000A103R61")
 
     if st.button("Загрузить введённые ISIN"):
         if user_isins.strip():
-            isin_list = [i.strip() for i in user_isins.splitlines() if i.strip()]
+            # Убираем дубликаты и пустые строки
+            isin_list = list(set(i.strip() for i in user_isins.splitlines() if i.strip()))
             with st.spinner(f"Загружаю {len(isin_list)} облигаций..."):
                 load_bonds_and_prices(conn, isin_list)
             st.success(f"Загружено {len(isin_list)} облигаций!")
+            st.cache_data.clear()
             st.rerun()
         else:
             st.warning("Введите хотя бы один ISIN.")
 
-    # Статистика базы
+    st.divider()
+
     bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
     price_count = conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
     st.metric("Облигаций в базе", bond_count)
@@ -66,7 +82,6 @@ with st.sidebar:
 
     st.divider()
 
-    # Форма добавления сделки
     st.subheader("➕ Новая сделка")
     with st.form("add_transaction"):
         isin_list = [row["isin"] for row in conn.execute("SELECT isin FROM bonds").fetchall()]
@@ -88,6 +103,7 @@ with st.sidebar:
                         VALUES (?, ?, ?, ?, ?, ?, ?)
                     """, (bond_id, tx_date.strftime("%Y-%m-%d"), tx_type, qty, tx_price, tx_nkd, tx_commission))
                     conn.commit()
+                    st.cache_data.clear()      # сбрасываем кеш метрик и купонов
                     st.success(f"Сделка {tx_type} {qty} шт. {selected_isin} добавлена!")
                     st.rerun()
                 else:
@@ -95,10 +111,9 @@ with st.sidebar:
         else:
             st.warning("Сначала загрузите облигации через кнопку выше.")
 
-# ===================== ВКЛАДКИ =====================
+# ---------- Вкладки ----------
 tab1, tab2, tab3, tab4 = st.tabs(["📋 Обзор", "🗂 Структура", "💰 Купоны", "⚠️ Риски"])
 
-# --- Вкладка "Обзор" ---
 with tab1:
     st.header("Текущий портфель")
     positions = get_portfolio_positions(conn)
@@ -115,8 +130,7 @@ with tab1:
                 FROM prices p
                 JOIN bonds b ON p.bond_id = b.id
                 WHERE b.isin = ?
-                ORDER BY p.date DESC
-                LIMIT 1
+                ORDER BY p.date DESC LIMIT 1
             """, (isin,)).fetchone()
             return row if row else (None, None)
 
@@ -124,7 +138,6 @@ with tab1:
         df["Текущая цена, %"] = [lp[0] if lp[0] else None for lp in last_prices]
         df["Текущий НКД, ₽"] = [lp[1] if lp[1] else None for lp in last_prices]
 
-        # Расчёт YTM и дюрации
         bonds_info = {}
         for row in conn.execute("SELECT isin, nominal, coupon_rate, coupon_frequency, maturity_date FROM bonds").fetchall():
             bonds_info[row['isin']] = row
@@ -133,10 +146,13 @@ with tab1:
         md_values = []
         for idx, isin in enumerate(df["ISIN"]):
             price = df.loc[idx, "Текущая цена, %"]
+            nkd = df.loc[idx, "Текущий НКД, ₽"]
             info = bonds_info.get(isin)
-            if price and info:
-                ytm = calc_ytm(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'])
-                md = modified_duration(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'], ytm)
+            if price is not None and nkd is not None and info:
+                ytm = calc_ytm(price, info['nominal'], info['coupon_rate'], 
+                               info['coupon_frequency'], info['maturity_date'], nkd=nkd)
+                md = modified_duration(price, info['nominal'], info['coupon_rate'], 
+                                      info['coupon_frequency'], info['maturity_date'], ytm=ytm, nkd=nkd)
             else:
                 ytm = None
                 md = None
@@ -146,7 +162,6 @@ with tab1:
         df["YTM, %"] = [f"{y:.2f}" if y is not None else "N/A" for y in ytm_values]
         df["Мод. дюрация, %"] = [f"{d:.2f}" if d is not None else "N/A" for d in md_values]
 
-        # Текущая стоимость позиции
         def calc_current_value(row, price_col, nkd_col):
             if row[price_col] and row["Номинал"]:
                 return row["Количество"] * (row[price_col] / 100.0 * row["Номинал"]) + row[nkd_col]
@@ -178,7 +193,6 @@ with tab1:
             st.metric("Средневзвешенная YTM портфеля", f"{weighted_ytm:.2f}%")
             st.metric("Средневзвешенная модифицированная дюрация портфеля", f"{weighted_md:.2f}%")
 
-# --- Вкладка "Структура" ---
 with tab2:
     st.header("Структура портфеля")
     positions = get_portfolio_positions(conn)
@@ -197,17 +211,24 @@ with tab2:
     else:
         st.info("Нет данных для отображения.")
 
-# --- Вкладка "Купоны" ---
 with tab3:
-    st.header("Купонные выплаты")
-    st.info("Здесь будет календарь и график денежного потока (на будущем этапе).")
+    st.header("💰 Купонные выплаты")
+    coupons_df = cached_coupon_flow()
+    if coupons_df.empty:
+        st.info("Портфель пуст или по всем облигациям уже прошло погашение.")
+    else:
+        coupons_df["Месяц"] = coupons_df["Дата"].apply(lambda d: d.strftime("%Y-%m"))
+        monthly = coupons_df.groupby("Месяц")["Общая сумма"].sum().reset_index().sort_values("Месяц")
 
-# --- Вкладка "Риски" ---
+        st.subheader("📅 Денежный поток по месяцам")
+        st.bar_chart(monthly.set_index("Месяц"))
+
+        st.subheader("📋 Ближайшие выплаты (первые 20)")
+        st.dataframe(coupons_df.head(20), use_container_width=True)
+
 with tab4:
     st.header("⚠️ Риски")
-    from src.metrics import calculate_historical_var, get_portfolio_metrics
-
-    metrics = get_portfolio_metrics(conn)
+    metrics = cached_portfolio_metrics()
     if metrics:
         col1, col2, col3 = st.columns(3)
         col1.metric("Средневзвешенная YTM", f"{metrics['weighted_ytm']:.2f}%" if metrics['weighted_ytm'] else "N/A")
@@ -216,13 +237,13 @@ with tab4:
 
         st.divider()
 
-        var_95 = calculate_historical_var(conn, confidence=0.95, horizon_days=10)
-        var_99 = calculate_historical_var(conn, confidence=0.99, horizon_days=10)
+        var_95 = cached_var(0.95, 10)
+        var_99 = cached_var(0.99, 10)
         if var_95 is not None:
             col1, col2 = st.columns(2)
             col1.metric("VaR 95% (10 дней)", f"{var_95:,.2f} ₽")
             col2.metric("VaR 99% (10 дней)", f"{var_99:,.2f} ₽" if var_99 else "N/A")
         else:
-            st.info("Недостаточно данных для расчёта VaR (нужна история цен).")
+            st.info("Недостаточно данных для расчёта VaR.")
     else:
         st.info("Портфель пуст или отсутствуют цены.")
