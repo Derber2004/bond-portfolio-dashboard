@@ -56,14 +56,7 @@ with st.sidebar:
         st.success("Данные загружены!")
         st.cache_data.clear()
         st.rerun()
-    # Загрузка всех облигаций (только справочник)
-    if st.button("📚 Загрузить все облигации с MOEX (без цен)"):
-        with st.spinner("Загружаю список всех облигаций... Это может занять 1-2 минуты"):
-            from src.data_loader import load_all_bonds_to_db
-            added = load_all_bonds_to_db(conn)
-        st.success(f"Добавлено {added} облигаций в справочник!")
-        st.cache_data.clear()
-        st.rerun()
+
     st.divider()
 
     st.subheader("📥 Загрузить свои облигации")
@@ -159,7 +152,7 @@ with st.sidebar:
     with st.expander("📋 Все доступные облигации"):
         all_bonds = conn.execute("SELECT isin, name, nominal, currency, bond_type FROM bonds ORDER BY isin").fetchall()
         if all_bonds:
-            st.dataframe(pd.DataFrame(all_bonds), use_container_width=True)
+            st.dataframe(pd.DataFrame(all_bonds), width='stretch')
         else:
             st.info("Справочник пуст.")
 
@@ -276,7 +269,7 @@ with tab1:
         col2.metric("Затраты на покупку", f"{total_cost:,.2f} ₽")
         col3.metric("Облигаций в портфеле", len(df))
 
-        st.dataframe(df, use_container_width=True)
+        st.dataframe(df, width='stretch')
 
         if total_value and any(ytm_values):
             weighted_ytm = 0.0
@@ -289,7 +282,34 @@ with tab1:
                         weighted_md += md_values[i] * weight
             st.metric("Средневзвешенная YTM портфеля", f"{weighted_ytm:.2f}%")
             st.metric("Средневзвешенная модифицированная дюрация портфеля", f"{weighted_md:.2f}%")
-
+    st.divider()
+    st.subheader("📈 Цены")
+    if st.button("🎲 Сгенерировать тестовые цены для портфеля"):
+        portfolio = conn.execute("""
+            SELECT isin FROM bonds b
+            JOIN transactions t ON b.id = t.bond_id
+            GROUP BY b.isin
+            HAVING SUM(CASE WHEN t.type='BUY' THEN t.quantity ELSE -t.quantity END) > 0
+        """).fetchall()
+        if portfolio:
+            from src.data_loader import generate_test_prices
+            for (isin,) in portfolio:
+                generate_test_prices(conn, isin)
+            st.success(f"Тестовые цены созданы для {len(portfolio)} облигаций.")
+            st.cache_data.clear()
+            st.rerun()
+        else:
+            st.warning("Сначала добавьте облигации в портфель.")
+            
+    # Загрузка цен из CSV
+    st.subheader("📁 Загрузить цены из CSV")
+    price_csv = st.file_uploader("CSV с ценами (isin, date, price, nkd)", type=["csv"], key="price_csv")
+    if price_csv and st.button("Загрузить цены из CSV"):
+        from src.data_loader import load_prices_from_csv
+        cnt = load_prices_from_csv(conn, price_csv)
+        st.success(f"Загружено {cnt} записей цен.")
+        st.cache_data.clear()
+        st.rerun()
         # --- Экспорт CSV ---
         st.divider()
         st.subheader("📥 Экспорт цен")
@@ -341,7 +361,7 @@ with tab3:
         st.bar_chart(monthly.set_index("Месяц"))
 
         st.subheader("📋 Ближайшие выплаты (первые 20)")
-        st.dataframe(coupons_df.head(20), use_container_width=True)
+        st.dataframe(coupons_df.head(20), width='stretch')
 
 with tab4:
     st.header("⚠️ Риски")
