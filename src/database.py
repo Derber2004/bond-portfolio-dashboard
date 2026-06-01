@@ -27,7 +27,7 @@ def init_db():
             coupon_frequency INTEGER,
             maturity_date TEXT,
             currency TEXT,
-            type TEXT,
+            bond_type TEXT,
             credit_rating TEXT
         );
     """)
@@ -64,7 +64,7 @@ def init_db():
 def add_bond(conn, isin, ticker, name, nominal, coupon_rate, coupon_frequency, maturity_date, currency, bond_type, credit_rating=None):
     """Добавляет новую облигацию или обновляет существующую по ISIN."""
     sql = """
-        INSERT INTO bonds (isin, ticker, name, nominal, coupon_rate, coupon_frequency, maturity_date, currency, type, credit_rating)
+        INSERT INTO bonds (isin, ticker, name, nominal, coupon_rate, coupon_frequency, maturity_date, currency, bond_type, credit_rating)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(isin) DO UPDATE SET
             ticker = excluded.ticker,
@@ -74,7 +74,7 @@ def add_bond(conn, isin, ticker, name, nominal, coupon_rate, coupon_frequency, m
             coupon_frequency = excluded.coupon_frequency,
             maturity_date = excluded.maturity_date,
             currency = excluded.currency,
-            type = excluded.type,
+            bond_type = excluded.bond_type,
             credit_rating = excluded.credit_rating;
     """
     conn.execute(sql, (isin, ticker, name, nominal, coupon_rate, coupon_frequency, maturity_date, currency, bond_type, credit_rating))
@@ -107,7 +107,7 @@ def get_portfolio_positions(conn):
             b.name,
             b.nominal,
             b.currency,
-            b.type,
+            b.bond_type as type,
             SUM(CASE WHEN t.type = 'BUY' THEN t.quantity ELSE -t.quantity END) as total_qty,
             CASE 
                 WHEN SUM(CASE WHEN t.type = 'BUY' THEN t.quantity ELSE 0 END) > 0 

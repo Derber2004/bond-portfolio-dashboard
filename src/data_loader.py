@@ -25,7 +25,7 @@ def get_bond_info_from_moex(isin):
     """
     Получает информацию об облигации по ISIN.
     Возвращает словарь с ключами: isin, ticker, name, nominal, coupon_rate,
-    coupon_frequency, maturity_date, currency, type.
+    coupon_frequency, maturity_date, currency, bond_type.
     """
     url = f"{MOEX_BASE}/securities/{isin}.json"
     data = fetch_json(url)
@@ -55,10 +55,14 @@ def get_bond_info_from_moex(isin):
     currency = get_val("FACEUNIT") or get_val("CURRENCYID")
     group = get_val("GROUPNAME")
 
-    if group and "федерального займа" in group.lower():
-        bond_type = "ОФЗ"
-    elif group and "корпоративные" in group.lower():
-        bond_type = "корпоративная"
+    # Безопасное определение типа облигации
+    if group and isinstance(group, str):
+        if "федерального займа" in group.lower():
+            bond_type = "ОФЗ"
+        elif "корпоративные" in group.lower():
+            bond_type = "корпоративная"
+        else:
+            bond_type = "прочая"
     else:
         bond_type = "прочая"
 
@@ -67,7 +71,7 @@ def get_bond_info_from_moex(isin):
     else:
         freq = 2
 
-        return {
+    return {
         "isin": isin_code,
         "ticker": ticker,
         "name": name,
@@ -76,7 +80,7 @@ def get_bond_info_from_moex(isin):
         "coupon_frequency": freq,
         "maturity_date": maturity_date_str,
         "currency": currency,
-        "bond_type": bond_type,          # <-- здесь было "type", стало "bond_type"
+        "bond_type": bond_type,
         "credit_rating": None
     }
 
@@ -97,21 +101,27 @@ def fetch_price_history(isin, from_date, till_date):
     data = fetch_json(url, params)
     if not data:
         return []
-    
-    # Если API возвращает список, а не словарь, обходим
+
+    # Иногда API возвращает список, иногда словарь с ключом history
     if isinstance(data, list):
-        logger.warning(f"Неожиданный формат ответа для {isin}: список. Пропускаем.")
-        return []
-    
-    history_block = data.get("history")
+        # Пытаемся найти блок history в первом элементе списка (если это список словарей)
+        if len(data) > 0 and isinstance(data[0], dict):
+            history_block = data[0].get("history")
+        else:
+            logger.warning(f"Неожиданный формат ответа для {isin}: список без history. Пропускаем.")
+            return []
+    else:
+        history_block = data.get("history")
+
     if not history_block:
         return []
+    
     history_data = history_block.get("data", [])
     cols = history_block["columns"]
     idx_date = cols.index("TRADEDATE")
     idx_close = cols.index("CLOSE")
     idx_nkd = cols.index("ACCRUEDINT")
-    
+
     result = []
     for row in history_data:
         d = row[idx_date]
@@ -128,38 +138,32 @@ def fetch_price_history(isin, from_date, till_date):
 def load_bonds_and_prices(conn, isin_list):
     """
     Для каждого ISIN загружает параметры облигации и историю цен с MOEX.
-    Если в базе уже есть цены, докачивает только пропущенные дни (начиная с последней даты).
+    Если в базе уже есть цены, докачивает только пропущенные дни.
     """
     end_date = datetime.now().strftime("%Y-%m-%d")
-    # Если нужно загрузить историю за последний год, используем эту дату как начало по умолчанию
     default_start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
 
     for isin in isin_list:
         logger.info(f"Обработка {isin}")
 
-        # 1. Загружаем/обновляем справочник облигации
         info = get_bond_info_from_moex(isin)
         if not info:
             logger.warning(f"Не удалось получить данные по {isin}, пропускаем.")
             continue
-        # Импортируем нужные функции (на случай, если модуль ещё не загружен)
-        #from src.database import add_bond, add_price, get_bond_id_by_isin, get_last_price_date
+
         add_bond(conn, **info)
         bond_id = get_bond_id_by_isin(conn, isin)
         if not bond_id:
             logger.error(f"Не удалось найти bond_id для {isin}")
             continue
 
-        # 2. Определяем, с какой даты начинать загрузку цен
         last_date = get_last_price_date(conn, isin)
         if last_date and last_date >= end_date:
             logger.info(f"Данные по {isin} актуальны (последняя дата {last_date}). Пропускаем.")
             continue
 
         if last_date:
-            # Начинаем со следующего дня после последней имеющейся даты
             start_date = (datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            # Если start_date оказался больше end_date (такого быть не должно, но проверим)
             if start_date > end_date:
                 logger.info(f"Данные по {isin} актуальны. Пропускаем.")
                 continue
@@ -174,7 +178,7 @@ def load_bonds_and_prices(conn, isin_list):
         time.sleep(0.2)
 
 
-# Список ISIN для теста (можно расширить)
+# Список ISIN для теста
 DEFAULT_ISINS = [
     "SU26226RMFS5",   # ОФЗ-ПД 26226
     "SU26238RMFS4",   # ОФЗ-ПД 26238

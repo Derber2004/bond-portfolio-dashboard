@@ -1,19 +1,10 @@
 import numpy as np
-from datetime import datetime, date
+from datetime import date
 from scipy.optimize import newton
 import pandas as pd
 
 def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, current_date=None):
-    """
-    Доходность к погашению (YTM) через численное решение (Ньютон).
-    price_percent: цена в % от номинала
-    nominal: номинал (например, 1000)
-    coupon_rate: купонная ставка, % годовых
-    frequency: количество выплат в год (обычно 2)
-    maturity_date: str 'YYYY-MM-DD' или date
-    current_date: дата расчёта (если None - сегодня)
-    Возвращает YTM в % годовых или None.
-    """
+    """Доходность к погашению (YTM) через численное решение (Ньютон)."""
     if price_percent is None or nominal is None or coupon_rate is None or not maturity_date:
         return None
 
@@ -56,10 +47,7 @@ def calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date, curr
         return None
 
 def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm=None):
-    """
-    Модифицированная дюрация (в процентах).
-    Если ytm не передана, рассчитывается автоматически.
-    """
+    """Модифицированная дюрация (в процентах)."""
     if ytm is None:
         ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date)
     if ytm is None:
@@ -88,13 +76,10 @@ def modified_duration(price_percent, nominal, coupon_rate, frequency, maturity_d
     macaulay /= dirty_price
 
     mod_dur = macaulay / (1 + y / periods_per_year)
-    return mod_dur * 100  # в процентах
+    return mod_dur * 100
 
 def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm=None):
-    """
-    Выпуклость (convexity) на основе YTM.
-    Возвращает выпуклость в процентах (иногда масштабируют, здесь в абсолютных единицах).
-    """
+    """Выпуклость (convexity)."""
     if ytm is None:
         ytm = calc_ytm(price_percent, nominal, coupon_rate, frequency, maturity_date)
     if ytm is None:
@@ -121,48 +106,42 @@ def convexity(price_percent, nominal, coupon_rate, frequency, maturity_date, ytm
         pv_cf = cf / ((1 + y) ** t)
         conv += t * (t + 1) * pv_cf
     conv = conv / ((1 + y) ** 2) / dirty_price
-    return conv / (periods_per_year ** 2)  # стандартная формула выпуклости
+    return conv / (periods_per_year ** 2)
 
 def calculate_historical_var(conn, confidence=0.95, horizon_days=10):
     """
     Исторический VaR портфеля на основе дневных изменений цен облигаций.
     Использует последние доступные цены для всех бумаг в портфеле и их веса.
-    Возвращает VaR в денежном выражении (например, в рублях).
+    Возвращает VaR в денежном выражении.
     """
-    # Получаем текущие позиции с последней ценой и стоимостью
+    # Получаем текущие позиции с последней ценой через оконную функцию
     positions = conn.execute("""
-        SELECT b.isin, b.nominal, 
+        WITH last_prices AS (
+            SELECT bond_id, price, nkd,
+                   ROW_NUMBER() OVER (PARTITION BY bond_id ORDER BY date DESC) as rn
+            FROM prices
+        )
+        SELECT b.isin, b.nominal,
                SUM(CASE WHEN t.type='BUY' THEN t.quantity ELSE -t.quantity END) as qty,
-               p.price as current_price, p.nkd
+               lp.price as current_price, lp.nkd
         FROM bonds b
         JOIN transactions t ON b.id = t.bond_id
-        LEFT JOIN (
-            SELECT bond_id, price, nkd
-            FROM prices
-            WHERE (bond_id, date) IN (
-                SELECT bond_id, MAX(date) 
-                FROM prices 
-                GROUP BY bond_id
-            )
-        ) p ON b.id = p.bond_id
+        JOIN last_prices lp ON b.id = lp.bond_id AND lp.rn = 1
         GROUP BY b.id
-        HAVING qty > 0 AND current_price IS NOT NULL
+        HAVING qty > 0
     """).fetchall()
 
     if not positions:
         return None
 
-    # Стоимость каждой позиции
     values = []
     daily_returns = []
-    # Веса в портфеле
     total_value = 0.0
     for pos in positions:
         val = pos["qty"] * (pos["current_price"] / 100.0 * pos["nominal"] + pos["nkd"])
         values.append(val)
         total_value += val
 
-    # Собираем дневные доходности для каждой бумаги из истории цен
     for pos in positions:
         isin = pos["isin"]
         price_history = conn.execute("""
@@ -174,49 +153,35 @@ def calculate_historical_var(conn, confidence=0.95, horizon_days=10):
         """, (isin,)).fetchall()
         if len(price_history) < 2:
             continue
-        # Дневные изменения (процентные)
         prices = [row["price"] for row in price_history]
-        returns = np.diff(prices) / np.array(prices[:-1]) * 100  # в процентах
+        returns = np.diff(prices) / np.array(prices[:-1]) * 100
         daily_returns.append(returns)
 
     if not daily_returns:
         return None
 
-    # Выравниваем длину (берём минимальную длину ряда)
     min_len = min(len(r) for r in daily_returns)
-    aligned = np.array([r[-min_len:] for r in daily_returns])  # каждый ряд обрезаем до min_len последних значений
-
-    # Портфельные дневные доходности как взвешенная сумма
+    aligned = np.array([r[-min_len:] for r in daily_returns])
     weights = np.array([v / total_value for v in values])
-    portfolio_daily = (aligned.T * weights).sum(axis=1)  # массив дневных доходностей портфеля (%)
+    portfolio_daily = (aligned.T * weights).sum(axis=1)
 
-    # VaR на заданный горизонт: предполагаем масштабирование sqrt(horizon)
-    # Берём перцентиль (худшие 1-confidence)
     var_daily_percent = np.percentile(portfolio_daily, 100 * (1 - confidence))
     var_daily = total_value * var_daily_percent / 100.0
     var_horizon = var_daily * np.sqrt(horizon_days)
-    return -var_horizon  # положительное число — максимальный ожидаемый убыток
+    return -var_horizon
 
 def get_portfolio_metrics(conn):
-    """
-    Возвращает словарь с ключевыми портфельными метриками:
-    - total_value: текущая стоимость портфеля
-    - weighted_ytm: средневзвешенная YTM
-    - weighted_duration: средневзвешенная модифицированная дюрация
-    - weighted_convexity: средневзвешенная выпуклость
-    """
+    """Возвращает словарь с ключевыми портфельными метриками."""
     from src.database import get_portfolio_positions
 
     positions = get_portfolio_positions(conn)
     if not positions:
         return None
 
-    # Получаем последние цены и НКД для всех бумаг (так же, как в dashboard)
     bonds_info = {}
     for row in conn.execute("SELECT isin, nominal, coupon_rate, coupon_frequency, maturity_date FROM bonds").fetchall():
         bonds_info[row['isin']] = row
 
-    # Считаем текущую стоимость и YTM/дюрацию/выпуклость для каждой позиции
     total_value = 0.0
     weighted_ytm_sum = 0.0
     weighted_dur_sum = 0.0
@@ -225,7 +190,6 @@ def get_portfolio_metrics(conn):
     for pos in positions:
         isin = pos["isin"]
         qty = pos["total_qty"]
-        # Берём последнюю цену из таблицы цен
         price_row = conn.execute("""
             SELECT p.price, p.nkd
             FROM prices p
