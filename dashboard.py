@@ -8,6 +8,7 @@ from src.database import (
     get_portfolio_positions
 )
 from src.data_loader import load_bonds_and_prices, DEFAULT_ISINS
+from src.metrics import calc_ytm, modified_duration
 
 st.set_page_config(
     page_title="Мой портфель облигаций",
@@ -18,7 +19,7 @@ st.set_page_config(
 # Инициализация БД
 init_db()
 
-# Подключение к БД (кэшируем, но с возможностью обновления)
+# Подключение к БД (потокобезопасное, кэшируем один раз за сессию)
 @st.cache_resource
 def get_db_connection():
     return get_connection()
@@ -33,6 +34,7 @@ with st.sidebar:
     st.header("⚙️ Управление данными")
 
     # Загрузка тестовых облигаций
+        # Загрузка тестовых облигаций
     if st.button("🔄 Загрузить тестовые облигации с MOEX"):
         with st.spinner("Загружаю данные... Это может занять ~30 секунд"):
             load_bonds_and_prices(conn, DEFAULT_ISINS)
@@ -40,6 +42,21 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+
+    # Загрузка произвольных ISIN
+    st.subheader("📥 Загрузить свои облигации")
+    st.caption("Введите ISIN (по одному на строке).\nПример: SU26238RMFS4")
+    user_isins = st.text_area("Список ISIN", height=100, placeholder="SU26226RMFS5\nRU000A103R61")
+
+    if st.button("Загрузить введённые ISIN"):
+        if user_isins.strip():
+            isin_list = [i.strip() for i in user_isins.splitlines() if i.strip()]
+            with st.spinner(f"Загружаю {len(isin_list)} облигаций..."):
+                load_bonds_and_prices(conn, isin_list)
+            st.success(f"Загружено {len(isin_list)} облигаций!")
+            st.rerun()
+        else:
+            st.warning("Введите хотя бы один ISIN.")
 
     # Статистика базы
     bond_count = conn.execute("SELECT COUNT(*) FROM bonds").fetchone()[0]
@@ -52,7 +69,6 @@ with st.sidebar:
     # Форма добавления сделки
     st.subheader("➕ Новая сделка")
     with st.form("add_transaction"):
-        # Получить список ISIN из базы
         isin_list = [row["isin"] for row in conn.execute("SELECT isin FROM bonds").fetchall()]
         if isin_list:
             selected_isin = st.selectbox("ISIN облигации", isin_list)
@@ -90,12 +106,9 @@ with tab1:
     if not positions:
         st.info("Портфель пуст. Добавьте сделки через боковую панель.")
     else:
-        # Превращаем в DataFrame для удобства
         df = pd.DataFrame(positions, columns=["ISIN", "Название", "Номинал", "Валюта", "Тип",
                                               "Количество", "Средняя цена покупки, %", "Затраты, ₽"])
 
-        # Добавим текущую цену (пока заглушка, потом будем брать последнюю из prices)
-        # Для наглядности используем последнюю доступную цену из таблицы prices
         def get_last_price(isin):
             row = conn.execute("""
                 SELECT p.price, p.nkd
@@ -111,7 +124,29 @@ with tab1:
         df["Текущая цена, %"] = [lp[0] if lp[0] else None for lp in last_prices]
         df["Текущий НКД, ₽"] = [lp[1] if lp[1] else None for lp in last_prices]
 
-        # Рассчитаем текущую стоимость позиции (количество * (цена/100 * номинал) + НКД)
+        # Расчёт YTM и дюрации
+        bonds_info = {}
+        for row in conn.execute("SELECT isin, nominal, coupon_rate, coupon_frequency, maturity_date FROM bonds").fetchall():
+            bonds_info[row['isin']] = row
+
+        ytm_values = []
+        md_values = []
+        for idx, isin in enumerate(df["ISIN"]):
+            price = df.loc[idx, "Текущая цена, %"]
+            info = bonds_info.get(isin)
+            if price and info:
+                ytm = calc_ytm(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'])
+                md = modified_duration(price, info['nominal'], info['coupon_rate'], info['coupon_frequency'], info['maturity_date'], ytm)
+            else:
+                ytm = None
+                md = None
+            ytm_values.append(ytm)
+            md_values.append(md)
+
+        df["YTM, %"] = [f"{y:.2f}" if y is not None else "N/A" for y in ytm_values]
+        df["Мод. дюрация, %"] = [f"{d:.2f}" if d is not None else "N/A" for d in md_values]
+
+        # Текущая стоимость позиции
         def calc_current_value(row, price_col, nkd_col):
             if row[price_col] and row["Номинал"]:
                 return row["Количество"] * (row[price_col] / 100.0 * row["Номинал"]) + row[nkd_col]
@@ -121,31 +156,43 @@ with tab1:
             lambda r: calc_current_value(r, "Текущая цена, %", "Текущий НКД, ₽"), axis=1
         )
 
-        # Общие суммы
         total_cost = df["Затраты, ₽"].sum()
         total_value = df["Текущая стоимость, ₽"].sum()
 
         col1, col2, col3 = st.columns(3)
-        col1.metric("Общая стоимость портфеля", f"{total_value:,.2f} ₽")
+        col1.metric("Общая стоимость портфеля", f"{total_value:,.2f} ₽" if total_value else "N/A")
         col2.metric("Затраты на покупку", f"{total_cost:,.2f} ₽")
         col3.metric("Облигаций в портфеле", len(df))
 
         st.dataframe(df, use_container_width=True)
 
+        if total_value and any(ytm_values):
+            weighted_ytm = 0.0
+            weighted_md = 0.0
+            for i, ytm in enumerate(ytm_values):
+                if ytm is not None and df.loc[i, "Текущая стоимость, ₽"]:
+                    weight = df.loc[i, "Текущая стоимость, ₽"] / total_value
+                    weighted_ytm += ytm * weight
+                    if md_values[i] is not None:
+                        weighted_md += md_values[i] * weight
+            st.metric("Средневзвешенная YTM портфеля", f"{weighted_ytm:.2f}%")
+            st.metric("Средневзвешенная модифицированная дюрация портфеля", f"{weighted_md:.2f}%")
+
 # --- Вкладка "Структура" ---
 with tab2:
     st.header("Структура портфеля")
+    positions = get_portfolio_positions(conn)
     if positions:
-        df = pd.DataFrame(positions)
-        # Круговые диаграммы по типам и валютам
+        df = pd.DataFrame(positions, columns=["ISIN", "Название", "Номинал", "Валюта", "Тип",
+                                              "Количество", "Средняя цена покупки, %", "Затраты, ₽"])
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("По типу облигаций")
-            type_dist = df.groupby("type")["total_cost"].sum()
+            type_dist = df.groupby("Тип")["Затраты, ₽"].sum()
             st.bar_chart(type_dist)
         with col2:
             st.subheader("По валютам")
-            curr_dist = df.groupby("currency")["total_cost"].sum()
+            curr_dist = df.groupby("Валюта")["Затраты, ₽"].sum()
             st.bar_chart(curr_dist)
     else:
         st.info("Нет данных для отображения.")
@@ -157,5 +204,25 @@ with tab3:
 
 # --- Вкладка "Риски" ---
 with tab4:
-    st.header("Риски")
-    st.info("Дюрация, VaR, спреды — после добавления расчётов YTM.")
+    st.header("⚠️ Риски")
+    from src.metrics import calculate_historical_var, get_portfolio_metrics
+
+    metrics = get_portfolio_metrics(conn)
+    if metrics:
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Средневзвешенная YTM", f"{metrics['weighted_ytm']:.2f}%" if metrics['weighted_ytm'] else "N/A")
+        col2.metric("Средневзвешенная дюрация", f"{metrics['weighted_duration']:.2f}%" if metrics['weighted_duration'] else "N/A")
+        col3.metric("Средневзвешенная выпуклость", f"{metrics['weighted_convexity']:.4f}" if metrics['weighted_convexity'] else "N/A")
+
+        st.divider()
+
+        var_95 = calculate_historical_var(conn, confidence=0.95, horizon_days=10)
+        var_99 = calculate_historical_var(conn, confidence=0.99, horizon_days=10)
+        if var_95 is not None:
+            col1, col2 = st.columns(2)
+            col1.metric("VaR 95% (10 дней)", f"{var_95:,.2f} ₽")
+            col2.metric("VaR 99% (10 дней)", f"{var_99:,.2f} ₽" if var_99 else "N/A")
+        else:
+            st.info("Недостаточно данных для расчёта VaR (нужна история цен).")
+    else:
+        st.info("Портфель пуст или отсутствуют цены.")

@@ -4,9 +4,9 @@ import os
 DATABASE_PATH = os.path.join("data", "portfolio.db")
 
 def get_connection() -> sqlite3.Connection:
-    """Возвращает соединение с БД (создаёт файл, если его нет)."""
+    """Возвращает соединение с БД (создаёт файл, если его нет). Разрешено многопоточное использование."""
     os.makedirs("data", exist_ok=True)
-    conn = sqlite3.connect(DATABASE_PATH)
+    conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -122,3 +122,13 @@ def get_portfolio_positions(conn):
         HAVING total_qty > 0
     """
     return conn.execute(query).fetchall()
+
+def get_last_price_date(conn, isin):
+    """Возвращает последнюю дату, на которую есть цена для облигации по ISIN, или None."""
+    row = conn.execute("""
+        SELECT MAX(p.date) 
+        FROM prices p
+        JOIN bonds b ON p.bond_id = b.id
+        WHERE b.isin = ?
+    """, (isin,)).fetchone()
+    return row[0] if row and row[0] else None
